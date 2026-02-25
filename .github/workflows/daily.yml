@@ -2,9 +2,8 @@ name: Daily Phoneflows Validation
 
 on:
   schedule:
-    # GitHub cron is UTC. Example: 06:00 UTC daily.
-    - cron: "0 6 * * *"
-  workflow_dispatch: {}
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
 
 jobs:
   run:
