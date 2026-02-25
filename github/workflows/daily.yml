@@ -1,0 +1,31 @@
+name: Daily Phoneflows Validation
+
+on:
+  schedule:
+    # GitHub cron is UTC. Example: 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm ci || npm install
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run bot
+        env:
+          PF_CODE: ${{ secrets.PF_CODE }}
+          PF_LOGIN: ${{ secrets.PF_LOGIN }}
+          PF_PASSWORD: ${{ secrets.PF_PASSWORD }}
+        run: node run.js
