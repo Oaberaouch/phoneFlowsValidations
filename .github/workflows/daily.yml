@@ -28,3 +28,10 @@ jobs:
           PF_LOGIN: ${{ secrets.PF_LOGIN }}
           PF_PASSWORD: ${{ secrets.PF_PASSWORD }}
         run: node run.js
+        
+      - name: Upload artifacts (screenshots/html/trace)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phoneflows-artifacts
+          path: artifacts
