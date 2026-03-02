@@ -1,4 +1,9 @@
 // run.js
+// Playwright bot: login (including clicking ".user-change-button" when needed),
+// extract planning IDs from hidden inputs idple\d+ / idpls\d+,
+// validate each via authenticated POST to /adh/Adherents/etspln,
+// save artifacts (screenshot + html + optional trace) on failure.
+
 const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
@@ -22,7 +27,7 @@ function ts() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-async function saveFailureArtifacts(page, label) {
+async function saveArtifacts(page, label) {
   try {
     ensureDir(ARTIFACTS_DIR);
     const png = path.join(ARTIFACTS_DIR, `${ts()}_${label}.png`);
@@ -36,80 +41,96 @@ async function saveFailureArtifacts(page, label) {
   }
 }
 
-async function fillFirstVisible(page, candidates, value, label) {
-  if (!value) return false;
-
-  for (const c of candidates) {
-    const loc =
-      typeof c === "string" ? page.locator(c).first() : c.first();
-
-    try {
-      if ((await loc.count()) === 0) continue;
-
-      // must be visible + editable
-      const visible = await loc.isVisible().catch(() => false);
-      if (!visible) continue;
-
-      await loc.fill(value, { timeout: 5000 });
-      console.log(`Filled ${label} using: ${typeof c === "string" ? c : "locator"}`);
-      return true;
-    } catch {
-      // try next
-    }
+async function maybeClickUserChange(page) {
+  const btn = page.locator(".user-change-button").first();
+  if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+    console.log("Clicking .user-change-button to reveal full login form...");
+    await btn.click({ timeout: 10000 }).catch(() => null);
+    await page.waitForTimeout(500);
+    return true;
   }
-  console.log(`Did not fill ${label} (no visible editable input found).`);
   return false;
 }
 
-async function clickSubmit(page) {
-  const candidates = [
+async function fillField(page, selector, value, label) {
+  const loc = page.locator(selector).first();
+  await loc.waitFor({ state: "attached", timeout: 20000 });
+  // If it might be hidden, attached is enough; fill still works for most inputs.
+  // If your site blocks filling hidden inputs, change to {state:"visible"}.
+  await loc.fill(value);
+  console.log(`Filled ${label} (${selector})`);
+}
+
+async function submitLogin(page) {
+  const submitCandidates = [
     page.getByRole("button", { name: /se connecter/i }),
     page.getByRole("button", { name: /connexion/i }),
-    page.getByRole("button", { name: /login/i }),
     page.locator('button[type="submit"]'),
     page.locator('input[type="submit"]'),
   ];
 
-  for (const c of candidates) {
+  for (const c of submitCandidates) {
     try {
       if ((await c.count()) > 0 && (await c.first().isVisible().catch(() => false))) {
-        await c.first().click({ timeout: 8000 });
+        console.log("Submitting by clicking submit button...");
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded").catch(() => null),
+          c.first().click({ timeout: 10000 }),
+        ]);
         return true;
       }
-    } catch {}
+    } catch {
+      // continue
+    }
   }
 
-  // fallback: press Enter on password
+  // Fallback: form.submit()
   try {
-    const pwd = page.locator('input[type="password"]').first();
-    if ((await pwd.count()) > 0) {
-      await pwd.press("Enter");
-      return true;
-    }
-  } catch {}
+    console.log("Submitting via form.submit() fallback...");
+    const form = page.locator("form").first();
+    await Promise.all([
+      page.waitForLoadState("domcontentloaded").catch(() => null),
+      form.evaluate((f) => f.submit()),
+    ]);
+    return true;
+  } catch {
+    // continue
+  }
 
-  return false;
+  // Last fallback: press Enter in password field
+  try {
+    console.log("Submitting by pressing Enter in password field...");
+    await page.locator("#password, input[type='password']").first().press("Enter");
+    await page.waitForLoadState("domcontentloaded").catch(() => null);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function waitForPostLogin(page) {
-  const startUrl = page.url();
-
+  // Adjust/add a marker if you know a reliable element after login.
   const deadlineMs = 30000;
   const start = Date.now();
+  const startUrl = page.url();
 
   while (Date.now() - start < deadlineMs) {
-    const url = page.url();
-    const urlChanged = url !== startUrl;
+    const urlChanged = page.url() !== startUrl;
 
     const hasPlanningInputs =
-      (await page.locator('input[type="hidden"]').filter({ has: page.locator('[id^="idpl"]') }).count().catch(() => 0)) > 0 ||
       (await page.locator('input[type="hidden"][id^="idpl"]').count().catch(() => 0)) > 0 ||
       (await page.locator('input[type="hidden"][id^="idp"]').count().catch(() => 0)) > 0;
 
     const hasLogout =
       (await page.locator("text=/déconnexion|logout/i").count().catch(() => 0)) > 0;
 
+    // Sometimes you stay on the same URL but the app transitions to a logged-in state.
     if (urlChanged || hasPlanningInputs || hasLogout) return true;
+
+    // Also detect visible login error messages to fail faster (French/English variants).
+    const loginError =
+      (await page.locator("text=/mot de passe|incorrect|erreur|invalid/i").count().catch(() => 0)) > 0;
+    if (loginError) return false;
 
     await page.waitForTimeout(500);
   }
@@ -140,12 +161,15 @@ async function extractPlanningIds(page) {
 }
 
 async function getCsrfToken(page) {
-  const token = await page
+  // If the server requires CSRF, we support two common patterns:
+  // 1) ASP.NET hidden input __RequestVerificationToken
+  // 2) meta csrf token -> send in header
+  const aspnet = await page
     .locator('input[name="__RequestVerificationToken"]')
     .first()
     .inputValue()
     .catch(() => "");
-  if (token) return { kind: "aspnet", value: token };
+  if (aspnet) return { kind: "aspnet", value: aspnet };
 
   const meta = await page
     .locator('meta[name="csrf-token"], meta[name="xsrf-token"], meta[name="request-verification-token"]')
@@ -158,9 +182,9 @@ async function getCsrfToken(page) {
 }
 
 (async () => {
+  const CODE = mustGetEnv("PF_CODE");
+  const LOGIN = mustGetEnv("PF_LOGIN");
   const PASSWORD = mustGetEnv("PF_PASSWORD");
-  const CODE = process.env.PF_CODE || "";
-  const LOGIN = process.env.PF_LOGIN || "";
 
   ensureDir(ARTIFACTS_DIR);
 
@@ -178,62 +202,39 @@ async function getCsrfToken(page) {
     console.log("Opening:", SITE);
     await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Wait for the ONLY thing we know is visible from your screenshot: password input
-    const pwd = page.locator('input[type="password"]').first();
-    await pwd.waitFor({ state: "visible", timeout: 30000 });
+    // The CI behavior you saw suggests code/login might be hidden until this is clicked.
+    await maybeClickUserChange(page);
 
-    // Fill optional fields ONLY if a visible input exists (do not wait for .code; it can be hidden)
-    await fillFirstVisible(
-      page,
-      [
-        page.getByPlaceholder(/matricule/i),
-        "input#code",
-        'input[name="code"]',
-        'input.form-control.code',
-        'input[placeholder*="Matricule" i]',
-      ],
-      CODE,
-      "CODE"
-    );
+    // Wait for password field (most stable)
+    await page.locator("#password, input[type='password']").first().waitFor({ state: "attached", timeout: 30000 });
 
-    await fillFirstVisible(
-      page,
-      [
-        "input#login",
-        'input[name="login"]',
-        'input[name="username"]',
-        page.getByPlaceholder(/login|utilisateur|username/i),
-      ],
-      LOGIN,
-      "LOGIN"
-    );
+    // Fill exactly like your working console snippet
+    await fillField(page, ".code", CODE, "CODE");
+    await fillField(page, "#login", LOGIN, "LOGIN");
+    await fillField(page, "#password", PASSWORD, "PASSWORD");
 
-    await pwd.fill(PASSWORD);
-
-    const submitted = await clickSubmit(page);
+    const submitted = await submitLogin(page);
     if (!submitted) {
-      await saveFailureArtifacts(page, "no_submit");
-      throw new Error("Could not submit login form (no button, Enter failed).");
+      await saveArtifacts(page, "submit_failed");
+      throw new Error("Could not submit login form.");
     }
-
-    await page.waitForLoadState("domcontentloaded").catch(() => null);
 
     const loggedIn = await waitForPostLogin(page);
     if (!loggedIn) {
-      await saveFailureArtifacts(page, "login_not_confirmed");
+      await saveArtifacts(page, "login_not_confirmed");
       throw new Error("Login not confirmed (no redirect/post-login markers).");
     }
 
-    console.log("Login seems OK. URL:", page.url());
+    console.log("Login confirmed. URL:", page.url());
 
-    // Give async content a moment to render
+    // Allow any async render
     await page.waitForTimeout(1500);
 
     const planning = await extractPlanningIds(page);
     console.log(`Found planning IDs: ${planning.length}`);
 
     if (planning.length === 0) {
-      await saveFailureArtifacts(page, "no_planning_ids");
+      await saveArtifacts(page, "no_planning_ids");
       throw new Error("No planning IDs found after login.");
     }
 
@@ -295,7 +296,7 @@ async function getCsrfToken(page) {
     process.exit(result.ok ? 0 : 2);
   } catch (e) {
     console.error("ERROR:", e?.stack || e);
-    await saveFailureArtifacts(page, "fatal");
+    await saveArtifacts(page, "fatal");
 
     if (TRACE) {
       try {
