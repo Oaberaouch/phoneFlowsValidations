@@ -8,7 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
 
-const SITE = process.env.PF_SITE || "https://www.lm.phoneflows.ma/";
+const SITE = process.env.PF_SITE || "https://www.lm.phoneflows.ma/Login";
 const ARTIFACTS_DIR = process.env.PF_ARTIFACTS_DIR || "artifacts";
 const HEADLESS = process.env.PF_HEADLESS !== "0";
 const TRACE = process.env.PF_TRACE === "1";
