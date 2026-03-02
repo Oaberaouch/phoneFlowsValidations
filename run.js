@@ -22,46 +22,46 @@ function ts() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-async function safeScreenshot(page, name) {
+async function saveFailureArtifacts(page, label) {
   try {
     ensureDir(ARTIFACTS_DIR);
-    const file = path.join(ARTIFACTS_DIR, `${ts()}_${name}.png`);
-    await page.screenshot({ path: file, fullPage: true });
-    console.log(`Saved screenshot: ${file}`);
+    const png = path.join(ARTIFACTS_DIR, `${ts()}_${label}.png`);
+    const html = path.join(ARTIFACTS_DIR, `${ts()}_${label}.html`);
+    await page.screenshot({ path: png, fullPage: true });
+    fs.writeFileSync(html, await page.content(), "utf-8");
+    console.log(`Saved: ${png}`);
+    console.log(`Saved: ${html}`);
   } catch (e) {
-    console.log("Screenshot failed:", e?.message || e);
+    console.log("Failed to save artifacts:", e?.message || e);
   }
 }
 
-async function safeHtmlDump(page, name) {
-  try {
-    ensureDir(ARTIFACTS_DIR);
-    const file = path.join(ARTIFACTS_DIR, `${ts()}_${name}.html`);
-    const html = await page.content();
-    fs.writeFileSync(file, html, "utf-8");
-    console.log(`Saved HTML dump: ${file}`);
-  } catch (e) {
-    console.log("HTML dump failed:", e?.message || e);
-  }
-}
-
-async function fillIfPresent(page, locator, value, label) {
+async function fillFirstVisible(page, candidates, value, label) {
   if (!value) return false;
-  try {
-    const el = page.locator(locator).first();
-    if ((await el.count()) > 0 && (await el.isVisible().catch(() => false))) {
-      await el.fill(value, { timeout: 5000 });
-      console.log(`Filled ${label} using selector: ${locator}`);
+
+  for (const c of candidates) {
+    const loc =
+      typeof c === "string" ? page.locator(c).first() : c.first();
+
+    try {
+      if ((await loc.count()) === 0) continue;
+
+      // must be visible + editable
+      const visible = await loc.isVisible().catch(() => false);
+      if (!visible) continue;
+
+      await loc.fill(value, { timeout: 5000 });
+      console.log(`Filled ${label} using: ${typeof c === "string" ? c : "locator"}`);
       return true;
+    } catch {
+      // try next
     }
-  } catch {
-    // ignore
   }
+  console.log(`Did not fill ${label} (no visible editable input found).`);
   return false;
 }
 
 async function clickSubmit(page) {
-  // Try common French labels first, then generic submit buttons.
   const candidates = [
     page.getByRole("button", { name: /se connecter/i }),
     page.getByRole("button", { name: /connexion/i }),
@@ -76,55 +76,41 @@ async function clickSubmit(page) {
         await c.first().click({ timeout: 8000 });
         return true;
       }
-    } catch {
-      // try next
-    }
+    } catch {}
   }
 
-  // Fallback: press Enter in password field if exists
+  // fallback: press Enter on password
   try {
     const pwd = page.locator('input[type="password"]').first();
     if ((await pwd.count()) > 0) {
       await pwd.press("Enter");
       return true;
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
 
   return false;
 }
 
 async function waitForPostLogin(page) {
-  // “Logged in” heuristics: any of these becoming true is enough.
-  const conditions = [
-    page.locator('input[type="hidden"][id^="idpl"]').first(), // your planning hidden inputs
-    page.locator('input[type="hidden"][id^="idp"]').first(),  // broader
-    page.locator("text=/déconnexion|logout/i").first(),
-    page.locator("nav").first(),
-  ];
-
   const startUrl = page.url();
-
-  // Give the app time to redirect/load.
-  await page.waitForLoadState("domcontentloaded").catch(() => null);
 
   const deadlineMs = 30000;
   const start = Date.now();
 
   while (Date.now() - start < deadlineMs) {
-    // URL change can be a sign of login success
-    const urlChanged = page.url() !== startUrl;
+    const url = page.url();
+    const urlChanged = url !== startUrl;
 
-    for (const cond of conditions) {
-      const visible = await cond.isVisible().catch(() => false);
-      const exists = (await cond.count().catch(() => 0)) > 0;
-      if (visible || exists || urlChanged) {
-        return true;
-      }
-    }
+    const hasPlanningInputs =
+      (await page.locator('input[type="hidden"]').filter({ has: page.locator('[id^="idpl"]') }).count().catch(() => 0)) > 0 ||
+      (await page.locator('input[type="hidden"][id^="idpl"]').count().catch(() => 0)) > 0 ||
+      (await page.locator('input[type="hidden"][id^="idp"]').count().catch(() => 0)) > 0;
 
-    // If app loads data async, wait a bit.
+    const hasLogout =
+      (await page.locator("text=/déconnexion|logout/i").count().catch(() => 0)) > 0;
+
+    if (urlChanged || hasPlanningInputs || hasLogout) return true;
+
     await page.waitForTimeout(500);
   }
 
@@ -132,7 +118,6 @@ async function waitForPostLogin(page) {
 }
 
 async function extractPlanningIds(page) {
-  // Extract idple\d+ / idpls\d+ hidden inputs
   const items = await page.$$eval('input[type="hidden"]', (els) => {
     const out = [];
     for (const el of els) {
@@ -150,41 +135,32 @@ async function extractPlanningIds(page) {
     return out;
   });
 
-  // De-duplicate by planning id
   const seen = new Set();
-  const deduped = [];
-  for (const it of items) {
-    if (!seen.has(it.id)) {
-      seen.add(it.id);
-      deduped.push(it);
-    }
-  }
-  return deduped;
+  return items.filter((x) => (seen.has(x.id) ? false : (seen.add(x.id), true)));
 }
 
 async function getCsrfToken(page) {
-  // Support common CSRF patterns (ASP.NET MVC, etc.)
   const token = await page
     .locator('input[name="__RequestVerificationToken"]')
     .first()
     .inputValue()
     .catch(() => "");
-  if (token) return { name: "__RequestVerificationToken", value: token };
+  if (token) return { kind: "aspnet", value: token };
 
   const meta = await page
     .locator('meta[name="csrf-token"], meta[name="xsrf-token"], meta[name="request-verification-token"]')
     .first()
     .getAttribute("content")
     .catch(() => "");
-  if (meta) return { name: "csrf-meta", value: meta };
+  if (meta) return { kind: "meta", value: meta };
 
   return null;
 }
 
 (async () => {
+  const PASSWORD = mustGetEnv("PF_PASSWORD");
   const CODE = process.env.PF_CODE || "";
   const LOGIN = process.env.PF_LOGIN || "";
-  const PASSWORD = mustGetEnv("PF_PASSWORD");
 
   ensureDir(ARTIFACTS_DIR);
 
@@ -202,58 +178,67 @@ async function getCsrfToken(page) {
     console.log("Opening:", SITE);
     await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Best-effort fill for code / login / password (site may show only password, per your screenshot).
-    // Try multiple selectors for each field.
-    await fillIfPresent(page, ".code", CODE, "CODE (.code)");
-    await fillIfPresent(page, 'input[name="code"]', CODE, "CODE (name=code)");
-    await fillIfPresent(page, 'input[id*="code" i]', CODE, "CODE (id contains code)");
-    await fillIfPresent(page, 'input[placeholder*="code" i]', CODE, "CODE (placeholder contains code)");
+    // Wait for the ONLY thing we know is visible from your screenshot: password input
+    const pwd = page.locator('input[type="password"]').first();
+    await pwd.waitFor({ state: "visible", timeout: 30000 });
 
-    await fillIfPresent(page, "#login", LOGIN, "LOGIN (#login)");
-    await fillIfPresent(page, 'input[name="login"]', LOGIN, "LOGIN (name=login)");
-    await fillIfPresent(page, 'input[name="username"]', LOGIN, "LOGIN (name=username)");
-    await fillIfPresent(page, 'input[id*="login" i]', LOGIN, "LOGIN (id contains login)");
-    await fillIfPresent(page, 'input[placeholder*="login" i]', LOGIN, "LOGIN (placeholder contains login)");
-    await fillIfPresent(page, 'input[placeholder*="utilisateur" i]', LOGIN, "LOGIN (placeholder utilisateur)");
+    // Fill optional fields ONLY if a visible input exists (do not wait for .code; it can be hidden)
+    await fillFirstVisible(
+      page,
+      [
+        page.getByPlaceholder(/matricule/i),
+        "input#code",
+        'input[name="code"]',
+        'input.form-control.code',
+        'input[placeholder*="Matricule" i]',
+      ],
+      CODE,
+      "CODE"
+    );
 
-    // Password
-    const pwdLoc = page.locator('input[type="password"]').first();
-    await pwdLoc.waitFor({ state: "visible", timeout: 20000 });
-    await pwdLoc.fill(PASSWORD);
-    console.log("Filled PASSWORD");
+    await fillFirstVisible(
+      page,
+      [
+        "input#login",
+        'input[name="login"]',
+        'input[name="username"]',
+        page.getByPlaceholder(/login|utilisateur|username/i),
+      ],
+      LOGIN,
+      "LOGIN"
+    );
 
-    // Submit
+    await pwd.fill(PASSWORD);
+
     const submitted = await clickSubmit(page);
     if (!submitted) {
-      await safeScreenshot(page, "no_submit_found");
-      throw new Error("Could not find a submit action (button or Enter on password).");
+      await saveFailureArtifacts(page, "no_submit");
+      throw new Error("Could not submit login form (no button, Enter failed).");
     }
 
-    // Wait for navigation / async post-login load
     await page.waitForLoadState("domcontentloaded").catch(() => null);
+
     const loggedIn = await waitForPostLogin(page);
     if (!loggedIn) {
-      await safeScreenshot(page, "login_not_confirmed");
-      await safeHtmlDump(page, "login_not_confirmed");
-      throw new Error("Login could not be confirmed (no expected post-login elements found).");
+      await saveFailureArtifacts(page, "login_not_confirmed");
+      throw new Error("Login not confirmed (no redirect/post-login markers).");
     }
 
-    console.log("Login seems successful. Current URL:", page.url());
+    console.log("Login seems OK. URL:", page.url());
 
-    // If planning inputs load after XHR, give a short grace period.
+    // Give async content a moment to render
     await page.waitForTimeout(1500);
 
     const planning = await extractPlanningIds(page);
     console.log(`Found planning IDs: ${planning.length}`);
 
     if (planning.length === 0) {
-      await safeScreenshot(page, "no_planning_ids");
-      await safeHtmlDump(page, "no_planning_ids");
-      throw new Error("No planning hidden inputs found. The selector logic may not match the page you reach after login.");
+      await saveFailureArtifacts(page, "no_planning_ids");
+      throw new Error("No planning IDs found after login.");
     }
 
     const csrf = await getCsrfToken(page);
-    if (csrf) console.log("CSRF token detected (will be sent if applicable).");
+    if (csrf) console.log(`CSRF detected: ${csrf.kind}`);
 
     let success = 0;
     let failed = 0;
@@ -261,42 +246,39 @@ async function getCsrfToken(page) {
     for (const item of planning) {
       const url = new URL("/adh/Adherents/etspln", page.url()).toString();
 
-      // Form payload; include CSRF token if it’s an ASP.NET hidden field pattern.
       const form = { id: item.id, etat: "1" };
-      if (csrf?.name === "__RequestVerificationToken") {
+      const headers = {
+        "x-requested-with": "XMLHttpRequest",
+        "referer": page.url(),
+      };
+
+      if (csrf?.kind === "aspnet") {
         form.__RequestVerificationToken = csrf.value;
+      } else if (csrf?.kind === "meta") {
+        headers["x-csrf-token"] = csrf.value;
       }
 
       try {
         const resp = await context.request.post(url, {
           form,
-          headers: {
-            "x-requested-with": "XMLHttpRequest",
-            "referer": page.url(),
-            // If your app uses meta-token CSRF, it’s often expected in a header:
-            ...(csrf?.name === "csrf-meta" ? { "x-csrf-token": csrf.value } : {}),
-          },
+          headers,
           timeout: 30000,
         });
 
-        const status = resp.status();
-        const ok = resp.ok();
-
-        if (ok) {
+        if (resp.ok()) {
           success++;
         } else {
           failed++;
           const body = await resp.text().catch(() => "");
           console.log(
-            `FAILED validate id=${item.id} (${item.type}/${item.day}) status=${status} body_snippet=${body.slice(0, 200)}`
+            `FAIL id=${item.id} (${item.type}/${item.day}) status=${resp.status()} body=${body.slice(0, 200)}`
           );
         }
       } catch (e) {
         failed++;
-        console.log(`ERROR validate id=${item.id} (${item.type}/${item.day}):`, e?.message || e);
+        console.log(`ERROR id=${item.id}:`, e?.message || e);
       }
 
-      // Avoid hammering the endpoint
       await page.waitForTimeout(250);
     }
 
@@ -313,9 +295,7 @@ async function getCsrfToken(page) {
     process.exit(result.ok ? 0 : 2);
   } catch (e) {
     console.error("ERROR:", e?.stack || e);
-
-    await safeScreenshot(page, "fatal");
-    await safeHtmlDump(page, "fatal");
+    await saveFailureArtifacts(page, "fatal");
 
     if (TRACE) {
       try {

@@ -2,24 +2,46 @@ name: Daily Phoneflows Validation
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC daily
+    - cron: "0 6 * * *" # 06:00 UTC daily
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install deps
-        run: npm ci || npm install
+      # Optional: speed up installs
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node20-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node20-npm-
 
-      - name: Install Playwright browsers
+      - name: Install deps
+        run: |
+          npm ci || npm install
+
+      # Optional: speed up Playwright browser installs
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright browsers (Chromium)
         run: npx playwright install --with-deps chromium
 
       - name: Run bot
@@ -27,8 +49,11 @@ jobs:
           PF_CODE: ${{ secrets.PF_CODE }}
           PF_LOGIN: ${{ secrets.PF_LOGIN }}
           PF_PASSWORD: ${{ secrets.PF_PASSWORD }}
+          PF_TRACE: "1"
+          PF_HEADLESS: "1"
+          PF_ARTIFACTS_DIR: "artifacts"
         run: node run.js
-        
+
       - name: Upload artifacts (screenshots/html/trace)
         if: always()
         uses: actions/upload-artifact@v4
