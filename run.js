@@ -44,8 +44,8 @@ async function saveArtifacts(page, label) {
 async function maybeClickUserChange(page) {
   const btn = page.locator(".user-change-button").first();
   if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
-    console.log("Clicking .user-change-button to reveal full login form...");
-    await btn.click({ timeout: 10000 }).catch(() => null);
+    console.log("Double-clicking .user-change-button to reveal full login form...");
+    await btn.dblclick({ timeout: 10000 }).catch(() => null);
     await page.waitForTimeout(500);
     return true;
   }
