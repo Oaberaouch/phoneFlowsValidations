@@ -54,7 +54,7 @@ async function maybeClickUserChange(page) {
 
 async function fillField(page, selector, value, label) {
   const loc = page.locator(selector).first();
-  await loc.waitFor({ state: "visible", timeout: 20000 });
+  await loc.waitFor({ state: "attached", timeout: 20000 });
   // If it might be hidden, attached is enough; fill still works for most inputs.
   // If your site blocks filling hidden inputs, change to {state:"visible"}.
   await loc.fill(value);
